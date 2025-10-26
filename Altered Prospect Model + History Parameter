@@ -1,0 +1,147 @@
+import numpy as np
+import pandas as pd
+from scipy.special import expit  # logistic (sigmoid) function
+from scipy.optimize import minimize
+
+# Paste in terminal to run: 
+# /Users/miru/anaconda3/bin/python "Altered Prospect Theory model + History"
+
+# Load data Joyce's Altered Prospect Theory Model
+def load_phase2_data(path="Phase2_data (Raw Otto).csv"):
+    """
+    Load Phase 2 CSV, select & sort columns, and re-index trials per PID.
+    """
+    cols = ['PID','trial','X','confidence','hit','probL','probR',
+            'response','rt','stimL','stimR',
+            'P_Gamble','A_Gamble','A_Certain','Gamble']
+    
+    df_full = pd.read_csv(path)
+    df = df_full[cols]
+    df = df.sort_values(['PID','trial'])
+    df['trial'] = df.groupby('PID').cumcount() + 1
+    return df
+
+# Load data with history for Altered Prospect Theory Model With History
+def load_phase2_data_with_history(path="Phase2_data (Raw Otto).csv"):
+    """
+    Load Phase 2 CSV and extend with history variables (1 trial back).
+    """
+    # Load using Joyce's function
+    df = load_phase2_data(path)
+    
+    # Add previous choice (1 trial back per participant)
+    df["prev_choice"] = df.groupby("PID")["response"].shift(1)
+    df["prev_choice"] = df["prev_choice"].fillna(0)
+
+    return df
+
+# Load data for Altered APT model
+df_basic = load_phase2_data()
+
+# Load data for Altered APT model with History
+df_history = load_phase2_data_with_history()
+
+# Extract variables for Altered APT model
+V_certain_basic = df_basic["A_Certain"].values
+V_risky_basic = df_basic["A_Gamble"].values
+p_basic = df_basic["P_Gamble"].values
+choices_basic = df_basic["response"].values
+
+# Extract variables for Altered APT model with History
+V_certain_history = df_history["A_Certain"].values
+V_risky_history = df_history["A_Gamble"].values
+p_history = df_history["P_Gamble"].values
+choices_history = df_history["response"].values
+prev_choices = df_history["prev_choice"].values
+
+# ____________________________________________________________________________
+# Altered Prospect Theory model (no history)
+def subjective_value_model(params, V_certain, V_risky, p, choices):
+    """
+    params: [alpha_c, alpha_r, beta, mu]
+    V_certain: array of certain option values
+    V_risky: array of risky option values
+    p: array of risky option probabilities
+    choices: array of current choices (1=risky, 0=certain)
+    """
+    alpha_c, alpha_r, beta, mu = params
+
+    SV_certain = V_certain ** alpha_c
+    SV_risky = (p ** (1 - beta)) * (V_risky ** alpha_r)
+    dSV = SV_risky - SV_certain
+
+    p_gamble = expit(mu * dSV)
+
+    eps = 1e-10  # to prevent log(0)
+    nll = -np.sum(choices * np.log(p_gamble + eps) + (1 - choices) * np.log(1 - p_gamble + eps))
+    return nll
+
+# ____________________________________________________________________________
+# Altered Prospect Theory model + History effect (1-trial-back)
+def subjective_value_model_history(params, V_certain, V_risky, p, choices, prev_choices):
+    """
+    params: [alpha_c, alpha_r, beta, mu, gamma]
+    V_certain: array of certain option values
+    V_risky: array of risky option values
+    p: array of risky option probabilities
+    choices: array of current choices (1=risky, 0=certain)
+    prev_choices: array of previous trial choices (1=risky, 0=certain, np.nan or 0 for first trial)
+    """
+    alpha_c, alpha_r, beta, mu, gamma = params
+
+    # Compute subjective values (from Otto paper)
+    SV_certain = V_certain ** alpha_c
+    SV_risky = (p ** (1 - beta)) * (V_risky ** alpha_r)
+
+    # Subjective value difference
+    dSV = SV_risky - SV_certain
+
+    # Add history term
+    history_term = gamma * prev_choices
+
+    # Combine all into decision variable
+    decision_variable = mu * dSV + history_term
+
+    # Convert to probability via logistic function
+    p_gamble = expit(decision_variable)
+
+    # Avoid log(0)
+    eps = 1e-10
+    nll = -np.sum(
+        choices * np.log(p_gamble + eps) +
+        (1 - choices) * np.log(1 - p_gamble + eps)
+    )
+
+    return nll
+
+
+# Fit Altered APT model (no history)
+print("=== FITTING ALTERED APT MODEL (no history) ===")
+init_params_basic = [0.8, 0.8, 0.5, 2.0]  # [alpha_c, alpha_r, beta, mu]
+
+result_basic = minimize(
+    subjective_value_model,
+    init_params_basic,
+    args=(V_certain_basic, V_risky_basic, p_basic, choices_basic),
+    bounds=[(0.01, 2), (0.01, 2), (0, 2), (0.1, 10)]
+)
+
+print("'Altered APT model best-fit parameters:")
+print(result_basic.x)
+
+# Fit Altered APT model with History
+print("\n=== FITTING HISTORY MODEL ===")
+init_params_history = [0.8, 0.8, 0.5, 2.0, 0.0]  # [alpha_c, alpha_r, beta, mu, gamma]
+
+result_history = minimize(
+    subjective_value_model_history,
+    init_params_history,
+    args=(V_certain_history, V_risky_history, p_history, choices_history, prev_choices),
+    bounds=[(0.01, 2), (0.01, 2), (0, 2), (0.1, 10), (-5, 5)]
+)
+
+print("Altered APT model with History best-fit parameters:")
+print(result_history.x)
+
+
+# Compare Altered APT model with Altered APT model with History
