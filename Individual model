@@ -1,0 +1,278 @@
+# nov 2, done with c, modelling alpha and miu per participant per risk prob,
+# then combining estimates to fit beta in a joint model (p=0.5 and p=0.9 together)
+
+
+import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
+from scipy.special import expit
+
+# ---------------------------------------------------------
+# Load data phase 2 (from Otto et al. 2013)
+def load_phase2_df(path="/Users/miru/Documents/PSYC 385 Thesis/Phase2_data (Raw Otto).csv"):
+    cols = ['PID', 'trial', 'P_Gamble', 'A_Gamble', 'A_Certain', 'Gamble']
+    df = pd.read_csv(path)
+    df = df[cols].sort_values(['PID','trial']).reset_index(drop=True)
+    df['trial'] = df.groupby('PID').cumcount() + 1
+    return df
+
+df = load_phase2_df()
+
+# ---------------------------------------------------------
+# STEP 1: Simple Probability Weighting Model (α only) (from Yanan)
+# SV = exp(-(log(p)^alpha))
+
+def subjective_prob(p, alpha):
+    return np.exp(-(np.log(p) ** alpha))
+
+def nll_alpha(alpha, p, choices):
+    sv = subjective_prob(p, alpha)
+    sv = np.clip(sv, 1e-9, 1-1e-9)
+    return -np.sum(choices*np.log(sv) + (1-choices)*np.log(1-sv))
+
+alpha_results = []
+
+for pid, d in df.groupby("PID"):
+    for prob in [0.5, 0.9]:
+        sub = d[d['P_Gamble'] == prob]
+        if len(sub) < 20:
+            continue
+        
+        p = sub['P_Gamble'].values
+        choices = sub['Gamble'].astype(int).values
+        
+        res = minimize(nll_alpha,
+                       x0=[1.0],
+                       args=(p, choices),
+                       bounds=[(0.01, 5.0)])
+        
+        alpha_hat = res.x[0]
+        alpha_results.append([pid, prob, alpha_hat])
+
+alpha_df = pd.DataFrame(alpha_results, columns=["PID","probability","alpha_estimate"])
+print("\nSTEP 1 ALPHA ESTIMATES:\n", alpha_df)
+alpha_df.to_csv("/Users/miru/Documents/PSYC 385 Thesis/alpha_probability_weighting.csv", index=False)
+
+# ---------------------------------------------------------
+# STEP 2: Joint fit model (α, β, μ) (Dr. Masset's rec., combining both risk probs to fit for beta)
+# SV_r = p^(1-β) * A_gamble^α
+# SV_c = A_certain^α
+# P(gamble) = sigmoid(mu * (SV_r - SV_c))
+
+alpha_init_df = alpha_df.pivot(index="PID", columns="probability", values="alpha_estimate")
+alpha_init_df.columns = ["alpha_05", "alpha_09"]
+
+def subjective_values(p, A_g, A_c, alpha, beta):
+    SV_r = (p ** (1 - beta)) * (A_g ** alpha)  
+    SV_c = (A_c ** alpha)
+    return SV_r, SV_c
+
+def nll_joint(params, p, A_g, A_c, choices):  # Negative Log-Likelihood of the joint (α, β, μ) model
+    alpha, beta, mu = params   
+    SV_r, SV_c = subjective_values(p, A_g, A_c, alpha, beta)
+    p_gamble = expit(mu * (SV_r - SV_c))
+    p_gamble = np.clip(p_gamble, 1e-9, 1-1e-9)
+    return -np.sum(choices*np.log(p_gamble) + (1-choices)*np.log(1-p_gamble))
+
+joint_results = []
+
+# use up to 100 trials per participant per probability 
+rng = np.random.default_rng(seed=0)
+min_trials_per_prob = 20
+max_trials_per_prob = 100   # use up to 100 trials per p(risky)
+n_restarts = 20             # number of random restarts per participant 
+bounds = [(0.01, 5.0), (-2.0, 2.0), (0.01, 20.0)]  # [alpha, beta, mu]
+
+print("Starting simplified joint fits (up to 100 trials per prob) ...", flush=True)
+for i, (pid, sub_full) in enumerate(df.groupby("PID"), start=1):
+    if pid not in alpha_init_df.index: # skip participant if we haven't computed and alpha for it
+        continue
+
+    # get up to 100 trials for each probability
+    parts = [] 
+    ok = True # flag to check if we have enough trials for both probs
+    for prob in [0.5, 0.9]: # get data for each prob
+        sub_prob = sub_full[sub_full['P_Gamble'] == prob].reset_index(drop=True) # filter for this prob
+        n_avail = len(sub_prob) # available trials for this prob
+        if n_avail < min_trials_per_prob:
+            ok = False
+            break
+        n_take = min(max_trials_per_prob, n_avail) 
+        idx = rng.choice(n_avail, size=n_take, replace=False) #
+        parts.append(sub_prob.iloc[idx])
+    if not ok: 
+        continue
+
+    d = pd.concat(parts).reset_index(drop=True)  # combined data (both probs)
+    p = d["P_Gamble"].values
+    A_g = d["A_Gamble"].values
+    A_c = d["A_Certain"].values
+    choices = d["Gamble"].astype(int).values
+
+    # informed alpha init (mean of the two prob-specific alpha estimates)
+    alpha_init = alpha_init_df.loc[pid].mean()
+
+    best_res = None
+    for _ in range(n_restarts):
+        x0 = [
+            float(rng.normal(loc=alpha_init, scale=0.2)),   # alpha init
+            float(rng.uniform(-0.5, 0.5)),                  # beta init 
+            float(rng.uniform(0.1, 5.0))                    # mu init
+        ]
+        # clip to bounds
+        x0[0] = np.clip(x0[0], bounds[0][0], bounds[0][1])
+        x0[1] = np.clip(x0[1], bounds[1][0], bounds[1][1])
+        x0[2] = np.clip(x0[2], bounds[2][0], bounds[2][1])
+
+        try:
+            res_try = minimize(
+                nll_joint,
+                x0=x0,
+                args=(p, A_g, A_c, choices),
+                bounds=bounds,
+                method="L-BFGS-B",
+                options={"maxiter": 1000}
+            )
+        except Exception:
+            continue
+
+        if best_res is None or (hasattr(res_try, "fun") and res_try.fun < best_res.fun):
+            best_res = res_try
+
+    if best_res is not None and hasattr(best_res, "x"):
+        alpha_hat, beta_hat, mu_hat = best_res.x
+        ll = -best_res.fun
+        success = bool(getattr(best_res, "success", False))
+        # record how many trials were used per prob (n_take) -> total trials = 2 * n_take unless asymmetry
+        trials_per_prob_used = [min(max_trials_per_prob, len(sub_full[sub_full['P_Gamble']==prob])) for prob in (0.5,0.9)]
+        joint_results.append([pid, alpha_hat, beta_hat, mu_hat, ll, success, trials_per_prob_used[0], trials_per_prob_used[1]])
+    else:
+        joint_results.append([pid, np.nan, np.nan, np.nan, np.nan, False, 0, 0])
+
+    if i % 10 == 0:
+        print(f"Processed {i} participants...", flush=True)
+
+# Update DataFrame columns
+joint_df = pd.DataFrame(joint_results, columns=["PID","alpha","beta","mu","loglik","success","n_trials_p05","n_trials_p09"])
+print("\nSTEP 2 JOINT MODEL ESTIMATES:\n", joint_df)
+joint_df.to_csv("/Users/miru/Documents/PSYC 385 Thesis/final_joint_APT_fits.csv", index=False)
+
+# FILTER: disregard individuals with mu < 0.3 (random/noisy participants)
+filtered_joint_df = joint_df[joint_df['mu'] >= 0.3].reset_index(drop=True)
+n_removed = len(joint_df) - len(filtered_joint_df)
+print(f"Filtered out {n_removed} participants with mu < 0.3. Remaining: {len(filtered_joint_df)}", flush=True)
+
+
+# ---------------------------------------------------------
+# PLOTS
+import matplotlib.pyplot as plt
+import numpy as np
+
+# 1. Summary plot: 3 histograms + correlation heatmap
+cols = ['alpha', 'beta', 'mu']  # restore beta in plots
+data = filtered_joint_df[cols].dropna()
+
+fig, axes = plt.subplots(1, 3, figsize=(12, 4), gridspec_kw={'width_ratios':[1,1,1]})
+
+# histograms
+for i, col in enumerate(cols):
+    axes[i].hist(data[col], bins=15, color='C{}'.format(i), edgecolor='k', alpha=0.75)
+    axes[i].set_title(f'{col} histogram')
+    axes[i].set_xlabel(col)
+    axes[i].set_ylabel('count')
+    axes[i].grid(alpha=0.2)
+
+# correlation heatmap 
+if not data.empty:
+    corr = data.corr()
+    im = axes[2].imshow(corr.values, vmin=-1, vmax=1, cmap='coolwarm')
+    axes[2].set_xticks(range(len(cols))); axes[2].set_yticks(range(len(cols)))
+    axes[2].set_xticklabels(cols); axes[2].set_yticklabels(cols)
+    axes[2].set_title('Correlation Matrix')
+    # annotate values
+    for (j,k), val in np.ndenumerate(corr.values):
+        axes[2].text(k, j, f'{val:.2f}', ha='center', va='center', color='white' if abs(val)>0.5 else 'black')
+    fig.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
+else:
+    axes[2].text(0.5, 0.5, 'no data', ha='center', va='center')
+    axes[2].set_axis_off()
+
+plt.tight_layout()
+plt.show()
+# -------------------------------------------------
+# 2. Plot ΔEV vs % gambled, split by β threshold (fixed)
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Use the filtered fitted parameters
+params = filtered_joint_df[['PID','beta']]
+
+# Merge params back into Phase 2 behavioral dataframe
+plot_df = df.merge(params, on='PID', how='inner').copy()
+
+# Compute ΔEV = (p × GambleValue) − CertainValue
+plot_df['delta_EV'] = (plot_df['P_Gamble'] * plot_df['A_Gamble']) - plot_df['A_Certain']
+
+# drop rows with missing beta or delta_EV
+plot_df = plot_df.dropna(subset=['beta','delta_EV'])
+
+# Define groups masks
+mask_seek = plot_df['beta'] < 1      # β < 1 → risk-seeking
+mask_averse = plot_df['beta'] >= 1   # β ≥ 1 → risk-averse / cautious
+
+# Bin ΔEV values (uniform bins across both groups)
+n_bins = 11
+if plot_df['delta_EV'].empty:
+    print("No delta_EV data to plot.")
+else:
+    bins = np.linspace(plot_df['delta_EV'].min(), plot_df['delta_EV'].max(), n_bins+1)
+    centers = 0.5 * (bins[:-1] + bins[1:])
+
+    seek_means = np.full(len(centers), np.nan)
+    averse_means = np.full(len(centers), np.nan)
+    seek_counts = np.zeros(len(centers), dtype=int)
+    averse_counts = np.zeros(len(centers), dtype=int)
+
+    for i in range(len(centers)):
+        left, right = bins[i], bins[i+1]
+        if i == len(centers)-1:
+            bin_mask = (plot_df['delta_EV'] >= left) & (plot_df['delta_EV'] <= right)
+        else:
+            bin_mask = (plot_df['delta_EV'] >= left) & (plot_df['delta_EV'] < right)
+
+        sub = plot_df[bin_mask]
+        sub_seek = sub[mask_seek.loc[sub.index]]
+        sub_averse = sub[mask_averse.loc[sub.index]]
+
+        if not sub_seek.empty:
+            seek_means[i] = sub_seek['Gamble'].mean()
+            seek_counts[i] = len(sub_seek)
+        if not sub_averse.empty:
+            averse_means[i] = sub_averse['Gamble'].mean()
+            averse_counts[i] = len(sub_averse)
+
+    # Plot, skipping bins with NaN means
+    fig, ax = plt.subplots(figsize=(8,5))
+    valid_seek = ~np.isnan(seek_means)
+    valid_averse = ~np.isnan(averse_means)
+
+    if valid_seek.any():
+        ax.plot(centers[valid_seek], seek_means[valid_seek], marker='o', linestyle='-', linewidth=2, label=f'Risk-Seeking (β < 1), bins with data={valid_seek.sum()}')
+    if valid_averse.any():
+        ax.plot(centers[valid_averse], averse_means[valid_averse], marker='o', linestyle='-', linewidth=2, label=f'Risk-Averse (β ≥ 1), bins with data={valid_averse.sum()}')
+
+    ax.axhline(0.5, color='gray', linestyle='--', linewidth=1)
+    ax.set_xlabel("ΔEV = (p × A_Gamble) − A_Certain")
+    ax.set_ylabel("P(Gamble)")
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_title("Risk-Seeking vs. Risk-Averse Behavioral Patterns")
+    ax.legend()
+    ax.grid(alpha=0.2)
+
+    plt.tight_layout()
+    plt.show()
+
+
+# alpha: decides subjective prob for 0.5 or 0.9, and its one per person
+# # formula yanan sent on teams
+# plot distributions of the subjective prob (either 0.5 or 0.9)
