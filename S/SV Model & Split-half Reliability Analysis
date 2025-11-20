@@ -1,0 +1,87 @@
+# Testing reliability of the Otto et al dataset
+
+# SV MODEL + RELIABILITY ANALYSIS
+
+# split half reliability analysis for subjective probability weighting model! Using all trials, split-half, 100 repeats per id
+# NOV 18th
+
+import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
+from scipy.special import expit
+from scipy.stats import pearsonr
+import matplotlib.pyplot as plt
+
+# -----------------------------------------------------
+# Load data
+def load_phase2_df(path="/Users/miru/Documents/PSYC 385 Thesis/Phase2_data (Raw Otto).csv"):
+    cols = ['PID','P_Gamble','A_Gamble','A_Certain','Gamble']
+    return pd.read_csv(path)[cols]
+
+df = load_phase2_df()
+
+# -----------------------------------------------------
+# Define the joint APT model 
+def subjective_values(p, A_g, A_c, alpha, beta):
+    SV_r = (p ** (1 - beta)) * (A_g ** alpha)
+    SV_c = (A_c ** alpha)
+    return SV_r, SV_c
+
+def nll_joint(params, p, A_g, A_c, choices):
+    alpha, beta, mu = params
+    SV_r, SV_c = subjective_values(p, A_g, A_c, alpha, beta)
+    p_gamble = expit(mu * (SV_r - SV_c))
+    p_gamble = np.clip(p_gamble, 1e-9, 1-1e-9)
+    return -np.sum(choices*np.log(p_gamble) + (1 - choices)*np.log(1 - p_gamble))
+
+bounds = [(0.01, 5.0), (-2, 2), (0.1, 20)]
+N_REPS = 100
+
+# -----------------------------------------------------
+# Split-half reliability analysis
+results = []
+
+for pid, d in df.groupby("PID"):
+    if len(d) < 40:
+        continue  # not enough trials
+
+    p = d["P_Gamble"].values
+    Ag = d["A_Gamble"].values
+    Ac = d["A_Certain"].values
+    choices = d["Gamble"].astype(int).values
+    n = len(d)
+
+    alpha1_list, alpha2_list = [], []
+    beta1_list, beta2_list = [], []
+    mu1_list, mu2_list = [], []
+
+    for _ in range(N_REPS):
+        idx = np.random.permutation(n)
+        half = n // 2
+        idx1, idx2 = idx[:half], idx[half:]
+
+        # fit half 1 of the trials
+        r1 = minimize(nll_joint, x0=[1,0,1], args=(p[idx1], Ag[idx1], Ac[idx1], choices[idx1]),
+                      bounds=bounds, method="L-BFGS-B")
+        # fit half 2 of the trials
+        r2 = minimize(nll_joint, x0=[1,0,1], args=(p[idx2], Ag[idx2], Ac[idx2], choices[idx2]),
+                      bounds=bounds, method="L-BFGS-B")
+
+        a1,b1,m1 = r1.x # fit params half 1
+        a2,b2,m2 = r2.x # fit params half 2
+
+        alpha1_list.append(a1); alpha2_list.append(a2) # fit alphas
+        beta1_list.append(b1);   beta2_list.append(b2) # fit betas
+        mu1_list.append(m1);     mu2_list.append(m2) # fit mus
+
+    # compute correlations for this participant
+    r_alpha = pearsonr(alpha1_list, alpha2_list)[0]
+    r_beta  = pearsonr(beta1_list,  beta2_list)[0]
+    r_mu    = pearsonr(mu1_list,    mu2_list)[0]
+
+    results.append([pid, r_alpha, r_beta, r_mu])
+
+# final dataframe
+reliability_df = pd.DataFrame(results, columns=["PID","rel_alpha","rel_beta","rel_mu"])
+reliability_df.to_csv("split_half_reliability_SV_model.csv", index=False)
+open('split_half_reliability_SV_model.csv', 'r')
